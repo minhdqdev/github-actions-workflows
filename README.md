@@ -18,7 +18,9 @@ jobs:
       image_name: my-django-app
       # Optional inputs:
       # python-version: "3.11"
-      # dockerfile: "./deploy/dockerfile"
+      # run_tests: true
+      # min_coverage: 70
+      # dockerfile: "Dockerfile"
     secrets:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}

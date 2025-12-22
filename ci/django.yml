@@ -7,6 +7,14 @@ on:
         required: false
         type: string
         default: "3.11"
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+      min_coverage:
+        required: false
+        type: number
+        default: 70
       image_name:
         required: true
         type: string
@@ -21,7 +29,7 @@ on:
       dockerfile:
         required: false
         type: string
-        default: "./deploy/dockerfile"
+        default: "Dockerfile"
       runs_on:
         required: false
         type: string
@@ -33,11 +41,57 @@ on:
         required: true
 
 jobs:
+  test:
+    if: ${{ inputs.run_tests }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: ${{ hashFiles('uv.lock') != '' }}
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: |
+          if [ -f "uv.lock" ]; then
+            uv sync --all-extras --dev
+          elif [ -f "poetry.lock" ]; then
+            pip install poetry
+            poetry install
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+            # Ensure pytest-cov is installed if not in requirements
+            pip install pytest pytest-cov || true
+          else
+            pip install .
+            pip install pytest pytest-cov || true
+          fi
+
+      - name: Run Tests
+        run: |
+          CMD="pytest --cov=. --cov-report=term-missing --cov-fail-under=${{ inputs.min_coverage }}"
+
+          if [ -f "uv.lock" ]; then
+            uv run $CMD
+          elif [ -f "poetry.lock" ]; then
+            poetry run $CMD
+          else
+            $CMD
+          fi
+
   build-and-push:
+    needs: test
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     runs-on: ${{ fromJson(inputs.runs_on) }}
     permissions:
       contents: read
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,12 +105,12 @@ jobs:
             echo "pyproject.toml not found, using run number"
             VERSION="0.0.${{ github.run_number }}"
           fi
-          
+
           if [ -z "$VERSION" ]; then
             echo "Could not extract version, using run number"
             VERSION="0.0.${{ github.run_number }}"
           fi
-          
+
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
