@@ -1,0 +1,154 @@
+name: Django CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        required: false
+        type: string
+        default: "3.11"
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+      min_coverage:
+        required: false
+        type: number
+        default: 70
+      version:
+        required: false
+        type: string
+        description: "Override version. If not provided, extracts from pyproject.toml"
+      tag_latest:
+        required: false
+        type: boolean
+        default: true
+      extra_tags:
+        required: false
+        type: string
+        description: "Additional tags (newline separated)"
+      image_name:
+        required: true
+        type: string
+      harbor_project:
+        required: false
+        type: string
+        default: "minhdqdev"
+      harbor_registry:
+        required: false
+        type: string
+        default: "harbor.minhdq.dev"
+      dockerfile:
+        required: false
+        type: string
+        default: "./deploy/dockerfile"
+      runs_on:
+        required: false
+        type: string
+        default: '["self-hosted", "minhdqdev-org", "manual"]'
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
+
+jobs:
+  test:
+    if: ${{ inputs.run_tests }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: ${{ hashFiles('uv.lock') != '' }}
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: |
+          if [ -f "uv.lock" ]; then
+            uv sync --all-extras --dev
+          elif [ -f "poetry.lock" ]; then
+            pip install poetry
+            poetry install
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+            # Ensure pytest-cov is installed if not in requirements
+            pip install pytest pytest-cov || true
+          else
+            pip install .
+            pip install pytest pytest-cov || true
+          fi
+
+      - name: Run Tests
+        run: |
+          CMD="pytest --cov=. --cov-report=term-missing --cov-fail-under=${{ inputs.min_coverage }}"
+          
+          if [ -f "uv.lock" ]; then
+            uv run $CMD
+          elif [ -f "poetry.lock" ]; then
+            poetry run $CMD
+          else
+            $CMD
+          fi
+
+  build-and-push:
+    needs: test
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            echo "Using provided version: $VERSION"
+          elif [ -f "pyproject.toml" ]; then
+            VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+            echo "Extracted version from pyproject.toml: $VERSION"
+          else
+            echo "pyproject.toml not found, using run number"
+            VERSION="0.0.${{ github.run_number }}"
+          fi
+          
+          if [ -z "$VERSION" ]; then
+            echo "Could not extract version, using run number"
+            VERSION="0.0.${{ github.run_number }}"
+          fi
+          
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.harbor_registry }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ inputs.harbor_registry }}/${{ inputs.harbor_project }}/${{ inputs.image_name }}:${{ steps.version.outputs.VERSION }}
+            ${{ inputs.tag_latest == true && format('{0}/{1}/{2}:latest', inputs.harbor_registry, inputs.harbor_project, inputs.image_name) || '' }}
+            ${{ inputs.harbor_registry }}/${{ inputs.harbor_project }}/${{ inputs.image_name }}:${{ github.sha }}
+            ${{ inputs.extra_tags }}
+          cache-from: type=registry,ref=${{ inputs.harbor_registry }}/${{ inputs.harbor_project }}/${{ inputs.image_name }}:buildcache
+          cache-to: type=registry,ref=${{ inputs.harbor_registry }}/${{ inputs.harbor_project }}/${{ inputs.image_name }}:buildcache,mode=max
