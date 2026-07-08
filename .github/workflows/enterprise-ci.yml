@@ -1,0 +1,509 @@
+name: Enterprise CI
+
+# Enterprise-grade, reusable build pipeline.
+#
+# Design goals over the lean ci.yml:
+#   - Fail fast: cheap static gates (secret scan, Dockerfile lint) run in parallel
+#     BEFORE the expensive image build, and block it on failure.
+#   - Least privilege: no job gets more than `contents: read`; each job that talks
+#     to Harbor logs in explicitly rather than relying on ambient state.
+#   - Supply-chain integrity: every pushed image is vulnerability-scanned (Trivy),
+#     accompanied by a CycloneDX SBOM, then signed and attested with cosign so
+#     ArgoCD / admission controllers can verify provenance before deploy.
+#   - Deterministic tags: same branch-scoped, ArgoCD-friendly tag strategy as ci.yml.
+#   - PR safety net: feature branches still BUILD the image (validation) but do not
+#     push, scan, or sign — those stages only run for real, pushed tags.
+#
+# Tool images are pulled from Harbor's docker-hub proxy-cache to avoid Docker Hub
+# rate limits and cold-network pulls, matching the buildkit strategy in ci.yml.
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        type: string
+        default: "./Dockerfile"
+        description: Path to the Dockerfile relative to the repository root.
+      dockerfile_target:
+        type: string
+        default: ""
+        description: Build target for multi-stage Dockerfiles.
+      runs_on:
+        type: string
+        default: '["self-hosted", "minhdqdev-org", "manual"]'
+        description: JSON array of runner labels. Override to target a different runner pool.
+      timeout_minutes:
+        type: number
+        default: 30
+        description: Per-job timeout guard against hung builds.
+      secret_scan:
+        type: boolean
+        default: true
+        description: Gate the build on a gitleaks secret scan of the full history.
+      lint_dockerfile:
+        type: boolean
+        default: true
+        description: Gate the build on a hadolint Dockerfile lint.
+      sast:
+        type: boolean
+        default: true
+        description: Run a Semgrep static analysis (SAST) scan.
+      sast_fail_build:
+        type: boolean
+        default: true
+        description: >-
+          Fail the build on Semgrep findings. Set false to introduce SAST in
+          audit mode (report-only) on a brownfield repo, then flip to true once
+          the existing backlog is triaged.
+      semgrep_config:
+        type: string
+        default: "p/default"
+        description: >-
+          Semgrep ruleset, fetched from the registry (needs egress to semgrep.dev).
+          Note "auto" is unsupported here — it requires telemetry, which we disable.
+          For air-gapped runners point at a vendored rules path (e.g. "./.semgrep").
+      enable_image_scan:
+        type: boolean
+        default: true
+        description: Run a Trivy vulnerability scan against the pushed image.
+      scan_fail_build:
+        type: boolean
+        default: true
+        description: Fail the pipeline when the image scan finds vulnerabilities at/above trivy_severities.
+      trivy_severities:
+        type: string
+        default: "CRITICAL,HIGH"
+        description: Comma-separated severities that fail the image scan.
+      trivy_db_repository:
+        type: string
+        default: "ghcr.io/aquasecurity/trivy-db:2"
+        description: Trivy vuln DB source. Point at an internal Harbor mirror for air-gapped runners.
+      enable_sbom:
+        type: boolean
+        default: true
+        description: Generate a CycloneDX SBOM for the pushed image and retain it as an artifact.
+      enable_signing:
+        type: boolean
+        default: true
+        description: cosign-sign the image by digest and attach the SBOM as an attestation.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pinned, Harbor-proxied tool images — single source of truth for every job below.
+  HADOLINT_IMAGE: harbor.internal.minhdq.dev/docker-hub/hadolint/hadolint:latest
+  GITLEAKS_IMAGE: harbor.internal.minhdq.dev/docker-hub/zricethezav/gitleaks:latest
+  TRIVY_IMAGE: harbor.internal.minhdq.dev/docker-hub/aquasec/trivy:latest
+  COSIGN_IMAGE: harbor.internal.minhdq.dev/docker-hub/sigstore/cosign:latest
+  SEMGREP_IMAGE: harbor.internal.minhdq.dev/docker-hub/semgrep/semgrep:latest
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve version, compute branch-scoped tags, decide whether to push.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: Resolve version & tags
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.tags.outputs.version }}
+      tags: ${{ steps.tags.outputs.tags }}
+      image: ${{ steps.tags.outputs.image }}
+      push: ${{ steps.tags.outputs.push }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: rc tags derive from `git rev-list --count`, which needs it.
+          fetch-depth: 0
+
+      - name: Resolve version & compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          # --- resolve version from project metadata, fall back to short SHA ---
+          VERSION=""
+          if [ -f "package.json" ]; then
+            VERSION=$(python3 -c "import json; v=json.load(open('package.json')).get('version'); print(v or '')") || VERSION=""
+          fi
+          if [ -z "$VERSION" ] && [ -f "pyproject.toml" ]; then
+            VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project'].get('version',''))") || VERSION=""
+          fi
+          if [ -z "$VERSION" ] && [ -f "Cargo.toml" ]; then
+            VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          fi
+          [ -n "$VERSION" ] || VERSION="$(git rev-parse --short HEAD)"
+
+          # --- branch-scoped tag strategy (mirrors ci.yml) ---
+          IMAGE="harbor.internal.minhdq.dev/minhdqdev/${{ github.event.repository.name }}"
+          REF="${{ github.ref }}"
+          TAGS=()
+          if [ "$REF" = "refs/heads/develop" ]; then
+            # DEV: dev-<short_sha>  →  ArgoCD latest strategy, regexp:^dev-.*$
+            TAGS+=("${IMAGE}:dev-$(git rev-parse --short HEAD)")
+          elif echo "$REF" | grep -qE "^refs/heads/rc/"; then
+            # UAT: <version>-rc.<commit_count>  →  ArgoCD semver strategy, regexp:^.*-rc\.[0-9]+$
+            # rev-list --count is per-branch monotonic with no gaps (unlike github.run_number).
+            TAGS+=("${IMAGE}:${VERSION}-rc.$(git rev-list --count HEAD)")
+          elif [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+            # PROD: <version> + latest  →  ArgoCD semver strategy
+            TAGS+=("${IMAGE}:${VERSION}")
+            TAGS+=("${IMAGE}:latest")
+          fi
+
+          # Push only when this ref maps to a release tag; feature branches build-only.
+          if [ "${#TAGS[@]}" -gt 0 ]; then PUSH="true"; else PUSH="false"; fi
+
+          {
+            echo "version=$VERSION"
+            echo "image=$IMAGE"
+            echo "push=$PUSH"
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved version=$VERSION push=$PUSH"
+          printf 'tags:\n%s\n' "${TAGS[*]:-<none — build-only>}"
+
+  # ---------------------------------------------------------------------------
+  # 2a. Static gate: secret scanning (parallel with lint, blocks build).
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan
+    if: ${{ inputs.secret_scan }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS_IMAGE" \
+            detect --source=/repo --redact --verbose --exit-code 1
+
+  # ---------------------------------------------------------------------------
+  # 2b. Static gate: Dockerfile lint (parallel with secret scan, blocks build).
+  # ---------------------------------------------------------------------------
+  dockerfile-lint:
+    name: Dockerfile lint
+    if: ${{ inputs.lint_dockerfile }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: hadolint
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error::Dockerfile not found at $DOCKERFILE"
+            exit 1
+          fi
+          # DL3008/DL3018: don't hard-fail on unpinned apt/apk versions; warn only.
+          docker run --rm -i "$HADOLINT_IMAGE" hadolint \
+            --failure-threshold error --ignore DL3008 --ignore DL3018 - < "$DOCKERFILE"
+
+  # ---------------------------------------------------------------------------
+  # 2c. Static gate: Semgrep SAST (parallel with the scans above, blocks build).
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    if: ${{ inputs.sast }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: semgrep scan
+        env:
+          SG_CONFIG: ${{ inputs.semgrep_config }}
+        run: |
+          set -euo pipefail
+          # --metrics=off: never phone home from an internal runner (registry
+          # rulesets like p/default still download; only "auto" needs telemetry).
+          # --error: non-zero exit on findings. Dropped in audit mode so a
+          # brownfield backlog reports without blocking (sast_fail_build=false).
+          ARGS="scan --config=$SG_CONFIG --metrics=off"
+          if [ "${{ inputs.sast_fail_build }}" = "true" ]; then
+            ARGS="$ARGS --error"
+          fi
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" semgrep $ARGS
+
+  # ---------------------------------------------------------------------------
+  # 3. Build & push the image (blocked by the static gates above).
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & push image
+    needs: [meta, secret-scan, dockerfile-lint, sast]
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # BuildKit from Harbor's docker-hub proxy-cache — no Docker Hub rate limit.
+          driver-opts: image=harbor.internal.minhdq.dev/docker-hub/moby/buildkit:buildx-stable-1
+
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.dockerfile_target }}
+          push: ${{ needs.meta.outputs.push == 'true' }}
+          # load locally when we are not pushing, so feature-branch builds still validate.
+          load: ${{ needs.meta.outputs.push != 'true' }}
+          tags: ${{ needs.meta.outputs.tags }}
+          provenance: false
+          cache-from: type=registry,ref=${{ needs.meta.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ needs.meta.outputs.image }}:buildcache,mode=max
+
+  # ---------------------------------------------------------------------------
+  # 4. Vulnerability scan + SBOM of the pushed image (by digest).
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: Image scan & SBOM
+    needs: [meta, build]
+    if: ${{ needs.meta.outputs.push == 'true' && (inputs.enable_image_scan || inputs.enable_sbom) }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      IMAGE_REF: ${{ needs.meta.outputs.image }}@${{ needs.build.outputs.digest }}
+      TRIVY_DB_REPOSITORY: ${{ inputs.trivy_db_repository }}
+    steps:
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: Vulnerability scan (Trivy)
+        if: ${{ inputs.enable_image_scan }}
+        run: |
+          set -euo pipefail
+          # exit-code 1 only when scan_fail_build is on; otherwise report-only.
+          CODE=$([ "${{ inputs.scan_fail_build }}" = "true" ] && echo 1 || echo 0)
+          # Trivy reads registry creds from TRIVY_USERNAME/PASSWORD — same Harbor account.
+          docker run --rm \
+            -e TRIVY_USERNAME="$HARBOR_USERNAME" -e TRIVY_PASSWORD="$HARBOR_PASSWORD" \
+            -e TRIVY_DB_REPOSITORY \
+            "$TRIVY_IMAGE" image \
+              --severity "${{ inputs.trivy_severities }}" \
+              --ignore-unfixed \
+              --exit-code "$CODE" \
+              --format table \
+              "$IMAGE_REF"
+
+      - name: Generate SBOM (CycloneDX)
+        if: ${{ inputs.enable_sbom }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e TRIVY_USERNAME="$HARBOR_USERNAME" -e TRIVY_PASSWORD="$HARBOR_PASSWORD" \
+            -e TRIVY_DB_REPOSITORY \
+            -v "$PWD:/out" \
+            "$TRIVY_IMAGE" image \
+              --format cyclonedx \
+              --output /out/sbom.cdx.json \
+              "$IMAGE_REF"
+
+      - name: Upload SBOM artifact
+        if: ${{ inputs.enable_sbom }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ needs.meta.outputs.version }}
+          path: sbom.cdx.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # 5. Sign the image by digest and attest the SBOM (cosign, key-based).
+  # ---------------------------------------------------------------------------
+  sign:
+    name: Sign & attest
+    needs: [meta, build, image-scan]
+    if: ${{ needs.meta.outputs.push == 'true' && inputs.enable_signing }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      IMAGE_REF: ${{ needs.meta.outputs.image }}@${{ needs.build.outputs.digest }}
+    steps:
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: Download SBOM artifact
+        if: ${{ inputs.enable_sbom }}
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ needs.meta.outputs.version }}
+
+      - name: cosign sign & attest
+        run: |
+          set -euo pipefail
+          # COSIGN_PRIVATE_KEY / COSIGN_PASSWORD are injected into the runner via envFrom
+          # (cosign-signing secret) — same mechanism as HARBOR_* and NOTIHUB_API_KEY.
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "::error::COSIGN_PRIVATE_KEY not set on runner; cannot sign. Disable enable_signing to skip."
+            exit 1
+          fi
+          # Mount the host docker config (written by `docker login`) so cosign
+          # authenticates to Harbor for the push of signatures/attestations.
+          COMMON_ARGS=(--rm
+            -e COSIGN_PASSWORD -e COSIGN_PRIVATE_KEY
+            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro"
+            -v "$PWD:/work" -w /work)
+
+          echo "Signing $IMAGE_REF"
+          docker run "${COMMON_ARGS[@]}" "$COSIGN_IMAGE" \
+            sign --yes --key env://COSIGN_PRIVATE_KEY "$IMAGE_REF"
+
+          if [ "${{ inputs.enable_sbom }}" = "true" ] && [ -f sbom.cdx.json ]; then
+            echo "Attesting SBOM for $IMAGE_REF"
+            docker run "${COMMON_ARGS[@]}" "$COSIGN_IMAGE" \
+              attest --yes --key env://COSIGN_PRIVATE_KEY \
+              --type cyclonedx --predicate sbom.cdx.json "$IMAGE_REF"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 6. Summary + notification — always runs, reports the real outcome.
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Summary & notify
+    needs: [meta, secret-scan, dockerfile-lint, sast, build, image-scan, sign]
+    if: ${{ always() && needs.meta.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Compute overall status
+        id: status
+        env:
+          SECRET_SCAN: ${{ needs.secret-scan.result }}
+          LINT: ${{ needs.dockerfile-lint.result }}
+          SAST: ${{ needs.sast.result }}
+          BUILD: ${{ needs.build.result }}
+          SCAN: ${{ needs.image-scan.result }}
+          SIGN: ${{ needs.sign.result }}
+        run: |
+          set -euo pipefail
+          # A gate that ran and failed → failure. Skipped gates (disabled or build-only) are OK.
+          STATUS="success"
+          for r in "$SECRET_SCAN" "$LINT" "$SAST" "$BUILD" "$SCAN" "$SIGN"; do
+            case "$r" in
+              failure|cancelled) STATUS="failure" ;;
+            esac
+          done
+          # `build` is skipped only when an upstream gate blocked it → surface as failure.
+          if [ "$BUILD" = "skipped" ]; then STATUS="failure"; fi
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        env:
+          STATUS: ${{ steps.status.outputs.status }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          PUSH: ${{ needs.meta.outputs.push }}
+        run: |
+          set -euo pipefail
+          if [ "$STATUS" = "success" ]; then ICON=":rocket:"; else ICON=":x:"; fi
+          {
+            echo "### CI ${STATUS} ${ICON}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| **Status** | \`${STATUS}\` |"
+            echo "| **Version** | \`${VERSION}\` |"
+            echo "| **Pushed** | \`${PUSH}\` |"
+            echo "| **Digest** | \`${DIGEST:-n/a}\` |"
+            echo "| **Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo "| **Ref** | \`${{ github.ref_name }}\` |"
+            echo "| **Commit** | \`${GITHUB_SHA:0:7}\` |"
+            if [ -n "$TAGS" ]; then
+              echo ""
+              echo "**Tags pushed:**"
+              echo ""
+              while IFS= read -r tag; do
+                [ -n "$tag" ] && echo "- \`${tag}\`"
+              done <<< "$TAGS"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Send notification
+        continue-on-error: true
+        env:
+          NOTIHUB_URL: https://notihub.internal.minhdq.dev
+          STATUS: ${{ steps.status.outputs.status }}
+          PROJECT_NAME: ${{ github.event.repository.name }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_NUMBER: ${{ github.run_number }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          # jq + curl are baked into the runner image. NOTIHUB_API_KEY is injected via
+          # envFrom (notihub-credentials secret) — same as HARBOR_*.
+          if [ -z "${NOTIHUB_API_KEY:-}" ]; then
+            echo "::warning::NOTIHUB_API_KEY not set on runner; skipping notification"
+            exit 0
+          fi
+          TAGS_LIST=$(while IFS= read -r tag; do [ -n "$tag" ] && printf '  • %s\n' "$tag"; done <<< "$TAGS")
+          if [ "$STATUS" = "success" ]; then
+            TITLE="✅ ${PROJECT_NAME} — CI/CD succeeded"
+            LEVEL="INFO"
+          else
+            TITLE="❌ ${PROJECT_NAME} — CI/CD failed"
+            LEVEL="ERROR"
+          fi
+          MESSAGE=$(printf 'Workflow: %s\nRun #%s on %s\nCommit: %s\nVersion: %s\nDigest: %s\nTags:\n%s' \
+            "$WORKFLOW" "$RUN_NUMBER" "$REF_NAME" "${GITHUB_SHA:0:7}" "$VERSION" "${DIGEST:-n/a}" "$TAGS_LIST")
+          jq -n \
+            --arg traceNo "github-run-${RUN_ID}" \
+            --arg origin "$PROJECT_NAME" \
+            --arg title "$TITLE" \
+            --arg message "$MESSAGE" \
+            --arg level "$LEVEL" \
+            '{traceNo: $traceNo, origin: $origin, level: $level, routeTo: {type: "TELEGRAM_CHANNEL"}, data: {title: $title, message: $message}}' \
+          | curl -fsS -m 10 -X POST "${NOTIHUB_URL%/}/api/v1/notifications/" \
+              -H 'Content-Type: application/json' \
+              -H "x-api-key: ${NOTIHUB_API_KEY}" \
+              --data-binary @-
