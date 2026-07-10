@@ -383,21 +383,27 @@ jobs:
             echo "::error::COSIGN_PRIVATE_KEY not set on runner; cannot sign. Disable enable_signing to skip."
             exit 1
           fi
-          # Mount the host docker config (written by `docker login`) so cosign
-          # authenticates to Harbor for the push of signatures/attestations.
+          # Give cosign the Harbor creds from `docker login`. The official cosign
+          # image runs as nonroot, so mounting to /root/.docker fails; instead
+          # point DOCKER_CONFIG at the mounted config and run as uid 0 so it can
+          # read the 0600 file regardless of the image's home dir.
+          # --tlog-upload=false: these are PRIVATE internal images — never publish
+          # their digests to the public Rekor transparency log.
           COMMON_ARGS=(--rm
+            --user 0
             -e COSIGN_PASSWORD -e COSIGN_PRIVATE_KEY
-            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro"
+            -e DOCKER_CONFIG=/dockercfg
+            -v "$HOME/.docker/config.json:/dockercfg/config.json:ro"
             -v "$PWD:/work" -w /work)
 
           echo "Signing $IMAGE_REF"
           docker run "${COMMON_ARGS[@]}" "$COSIGN_IMAGE" \
-            sign --yes --key env://COSIGN_PRIVATE_KEY "$IMAGE_REF"
+            sign --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY "$IMAGE_REF"
 
           if [ "${{ inputs.enable_sbom }}" = "true" ] && [ -f sbom.cdx.json ]; then
             echo "Attesting SBOM for $IMAGE_REF"
             docker run "${COMMON_ARGS[@]}" "$COSIGN_IMAGE" \
-              attest --yes --key env://COSIGN_PRIVATE_KEY \
+              attest --yes --tlog-upload=false --key env://COSIGN_PRIVATE_KEY \
               --type cyclonedx --predicate sbom.cdx.json "$IMAGE_REF"
           fi
 
