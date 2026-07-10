@@ -97,7 +97,9 @@ env:
   HADOLINT_IMAGE: harbor.internal.minhdq.dev/docker-hub/hadolint/hadolint:latest
   GITLEAKS_IMAGE: harbor.internal.minhdq.dev/docker-hub/zricethezav/gitleaks:latest
   TRIVY_IMAGE: harbor.internal.minhdq.dev/docker-hub/aquasec/trivy:latest
-  COSIGN_IMAGE: harbor.internal.minhdq.dev/docker-hub/sigstore/cosign:latest
+  # Official sigstore signer image lives on ghcr (not Docker Hub, so not
+  # Harbor-proxyable); the runner already reaches ghcr for Trivy's vuln DB.
+  COSIGN_IMAGE: ghcr.io/sigstore/cosign/cosign:v2.4.1
   SEMGREP_IMAGE: harbor.internal.minhdq.dev/docker-hub/semgrep/semgrep:latest
 
 jobs:
