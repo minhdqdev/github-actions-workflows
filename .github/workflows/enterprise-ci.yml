@@ -383,17 +383,23 @@ jobs:
             echo "::error::COSIGN_PRIVATE_KEY not set on runner; cannot sign. Disable enable_signing to skip."
             exit 1
           fi
-          # Give cosign the Harbor creds from `docker login`. The official cosign
-          # image runs as nonroot, so mounting to /root/.docker fails; instead
-          # point DOCKER_CONFIG at the mounted config and run as uid 0 so it can
-          # read the 0600 file regardless of the image's home dir.
+          # The runner uses a separate dockerd (DinD): that daemon resolves bind
+          # mounts against ITS filesystem, where only the shared workDir is
+          # visible — $HOME/.docker is NOT. So stage the Harbor creds (written by
+          # `docker login`) into a workDir-relative dir the daemon can mount.
+          CFG_DIR="$PWD/.cosign-docker"
+          mkdir -p "$CFG_DIR"
+          cp "$HOME/.docker/config.json" "$CFG_DIR/config.json"
+          trap 'rm -rf "$CFG_DIR"' EXIT
+
+          # --user 0 so cosign (nonroot image) can read the mounted creds.
           # --tlog-upload=false: these are PRIVATE internal images — never publish
           # their digests to the public Rekor transparency log.
           COMMON_ARGS=(--rm
             --user 0
             -e COSIGN_PASSWORD -e COSIGN_PRIVATE_KEY
             -e DOCKER_CONFIG=/dockercfg
-            -v "$HOME/.docker/config.json:/dockercfg/config.json:ro"
+            -v "$CFG_DIR:/dockercfg:ro"
             -v "$PWD:/work" -w /work)
 
           echo "Signing $IMAGE_REF"
