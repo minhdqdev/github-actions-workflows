@@ -12,11 +12,24 @@ Branch is detected at runtime to apply the correct tag strategy:
 | Branch | Tag produced | Environment | ArgoCD strategy |
 |--------|-------------|-------------|-----------------|
 | `develop` | `dev-<short_sha>` | DEV | `latest`, `regexp:^dev-.*$` |
-| `rc/*` | `<version>-rc.<run_number>` | UAT | `semver`, `regexp:^.*-rc\.[0-9]+$` |
+| `rc/<version>` | `<version>-rc.<commit_count>` | UAT | `semver`, `regexp:^.*-rc\.[0-9]+$` |
 | `main` / `master` | `<version>` + `latest` | PROD | `semver` |
 
 Version is resolved from `package.json`, `pyproject.toml`, or `Cargo.toml`. Falls back to
 the short commit SHA if none are present.
+
+**Name RC branches after the version they release** — `rc/0.1.120`, not `rc/my-feature`. The
+workflow triggers on `rc/**` so any name builds, but the branch name is how anyone reading the
+branch list knows which release is in UAT.
+
+`<commit_count>` is `git rev-list --count HEAD`, **not** `github.run_number`: it is per-branch
+monotonic with no gaps from unrelated branches. This is why the checkout step sets
+`fetch-depth: 0` — under the default shallow clone the count is always `1`, every RC builds
+`<version>-rc.1`, and ArgoCD Image Updater sees no newer tag and silently stops deploying.
+
+It also means **the version must be bumped for each new RC of the same release**. Two RC builds at
+the same version and commit count collide on the tag; the second overwrites the first and nothing
+deploys.
 
 #### Usage
 
