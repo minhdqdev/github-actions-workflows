@@ -27,6 +27,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: rc tags derive from `git rev-list --count`, which needs it.
+          # The default shallow clone has exactly one commit, so the count is always
+          # 1 and every rc/** branch builds `<version>-rc.1`. Two rc builds at the
+          # same version then collide on the tag and ArgoCD Image Updater has
+          # nothing newer to advance to -- it stops deploying, silently.
+          # enterprise-ci.yml has carried this since it was written.
+          fetch-depth: 0
 
       - name: Resolve version & compute tags
         id: tags
